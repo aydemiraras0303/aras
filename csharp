@@ -1,0 +1,323 @@
+using Godot;
+using System.Collections.Generic;
+using System.Linq; 
+
+public partial class TradeManager : Node
+{
+    // Sunucunun ID'si (Root Authority) Godot'da her zaman 1'dir.
+    private const long SERVER_ID = 1;
+    
+    public static TradeManager Instance;
+
+    // Aktif ticaret oturumları. long = Session ID
+    private Dictionary<long, TradeSession> activeTrades = new Dictionary<long, TradeSession>();
+    private long nextSessionId = 1;
+    
+    // InventoryManager MOCK (Gerçek envanter sınıfınızla değiştirin)
+    // private InventoryManager InventoryManager; 
+    
+    public override void _Ready()
+    {
+        // Singleton (Tekillik) deseni kurulumu
+        if (Instance == null)
+        {
+            Instance = this;
+            // Sahne değişimlerinde kalıcı olması için (isteğe bağlı)
+            // GetTree().Root.AddChild(this); 
+        }
+        else
+        {
+            QueueFree();
+        }
+    }
+    
+    // Helper: Bir oyuncunun zaten ticarette olup olmadığını kontrol eder (Sunucu tarafı)
+    private bool IsPlayerInTrade(long clientId)
+    {
+        foreach (var session in activeTrades.Values)
+        {
+            if (session.requesterId == clientId || session.targetId == clientId)
+                return true;
+        }
+        return false;
+    }
+    
+    // ====================================================================
+    // 1. İSTEMCİDEN SUNUCUYA ÇAĞRILAR (Oyun içi etkileşimlerden çağrılır)
+    // Bu metotlar RPC niteliğine sahip değildir, RpcId'yi çağırır.
+    // ====================================================================
+
+    /// <summary>İstemciden sunucuya ticaret isteği gönderme metodu.</summary>
+    public void SendTradeRequest(long targetId)
+    {
+        long requesterId = (long)Multiplayer.GetUniqueId();
+        // RPC'yi sunucuya (ID: 1) gönder
+        RpcId(SERVER_ID, nameof(RequestTradeRpc), requesterId, targetId);
+    }
+    
+    /// <summary>İstemciden sunucuya ticaret isteğine yanıt verme metodu.</summary>
+    public void SendTradeResponse(long sessionId, bool accept)
+    {
+        long clientId = (long)Multiplayer.GetUniqueId();
+        RpcId(SERVER_ID, nameof(RespondToTradeRpc), sessionId, clientId, accept);
+    }
+    
+    /// <summary>İstemciden sunucuya ticaret teklifine eşya ekleme metodu.</summary>
+    public void SendAddItemToTrade(long sessionId, int itemIndex)
+    {
+        long clientId = (long)Multiplayer.GetUniqueId();
+        RpcId(SERVER_ID, nameof(AddItemToTradeRpc), sessionId, clientId, itemIndex);
+    }
+    
+    /// <summary>İstemciden sunucuya ticaret teklifinden eşya çıkarma metodu.</summary>
+    public void SendRemoveItemFromTrade(long sessionId, int itemIndex)
+    {
+        long clientId = (long)Multiplayer.GetUniqueId();
+        RpcId(SERVER_ID, nameof(RemoveItemFromTradeRpc), sessionId, clientId, itemIndex);
+    }
+    
+    /// <summary>İstemciden sunucuya ticareti onaylama metodu.</summary>
+    public void SendConfirmTrade(long sessionId)
+    {
+        long clientId = (long)Multiplayer.GetUniqueId();
+        RpcId(SERVER_ID, nameof(ConfirmTradeRpc), sessionId, clientId);
+    }
+
+    /// <summary>İstemciden sunucuya ticareti iptal etme metodu.</summary>
+    public void SendCancelTrade(long sessionId)
+    {
+        long clientId = (long)Multiplayer.GetUniqueId();
+        RpcId(SERVER_ID, nameof(CancelTradeRpc), sessionId, clientId);
+    }
+    
+    // ====================================================================
+    // 2. SUNUCUDA ÇALIŞAN RPC METOTLARI (Yetkili Mantık)
+    // [Rpc(MultiplayerApi.RMode.Authority)] ile işaretlenmiştir.
+    // ====================================================================
+
+    [Rpc(MultiplayerApi.RMode.Authority)] // Sadece sunucuda çalışır
+    private void RequestTradeRpc(long requesterId, long targetId)
+    {
+        if (IsPlayerInTrade(requesterId) || IsPlayerInTrade(targetId))
+        {
+            GD.PrintErr($"Ticaret isteği reddedildi: Oyuncu {requesterId} veya {targetId} zaten ticarette.");
+            return;
+        }
+
+        long sessionId = nextSessionId++;
+        TradeSession session = new TradeSession(sessionId, requesterId, targetId);
+        activeTrades.Add(sessionId, session);
+
+        // Hedef oyuncuya ticaret daveti gönder (İstemciye RPC)
+        RpcId(targetId, nameof(ReceiveTradeInviteRpc), sessionId, requesterId);
+    }
+    
+    [Rpc(MultiplayerApi.RMode.Authority)]
+    private void RespondToTradeRpc(long sessionId, long clientId, bool accept)
+    {
+        if (activeTrades.TryGetValue(sessionId, out TradeSession session))
+        {
+            if (session.targetId != clientId) return;
+
+            if (accept)
+            {
+                // Her iki oyuncuya da arayüzü açmalarını bildir.
+                // Rpc() ile herkese göndeririz, ancak sadece requester ve target önemser.
+                Rpc(nameof(OpenTradeUIRpc), sessionId);
+            }
+            else
+            {
+                activeTrades.Remove(sessionId);
+                Rpc(nameof(TradeCancelledRpc), sessionId, "Davet reddedildi.");
+            }
+        }
+    }
+    
+    [Rpc(MultiplayerApi.RMode.Authority)]
+    private void AddItemToTradeRpc(long sessionId, long clientId, int itemIndex)
+    {
+        if (activeTrades.TryGetValue(sessionId, out TradeSession session))
+        {
+            bool added = false;
+            // Güvenlik kontrolü yapılmalı: Eşya gerçekten envanterde var mı?
+            
+            if (session.requesterId == clientId)
+            {
+                session.RequesterItems.Add(itemIndex);
+                added = true;
+            }
+            else if (session.targetId == clientId)
+            {
+                session.TargetItems.Add(itemIndex);
+                added = true;
+            }
+
+            if (added)
+            {
+                // Teklif değiştiği için onayları sıfırla
+                session.requesterConfirmed = false;
+                session.targetConfirmed = false;
+                
+                // Teklifleri ve onay durumunu tüm ilgili istemcilere gönder
+                // Godot RPC, int[] dizilerini destekler.
+                Rpc(nameof(UpdateTradeOfferRpc), sessionId, session.RequesterItems.ToArray(), session.TargetItems.ToArray());
+                Rpc(nameof(UpdateConfirmationStatusRpc), sessionId, false, false);
+            }
+        }
+    }
+    
+    [Rpc(MultiplayerApi.RMode.Authority)]
+    private void RemoveItemFromTradeRpc(long sessionId, long clientId, int itemIndex)
+    {
+        if (activeTrades.TryGetValue(sessionId, out TradeSession session))
+        {
+            bool removed = false;
+            
+            if (session.requesterId == clientId)
+            {
+                removed = session.RequesterItems.Remove(itemIndex);
+            }
+            else if (session.targetId == clientId)
+            {
+                removed = session.TargetItems.Remove(itemIndex);
+            }
+            
+            if (removed)
+            {
+                 // Teklif değiştiği için onayları sıfırla
+                session.requesterConfirmed = false;
+                session.targetConfirmed = false;
+
+                // Tüm istemcilere tekliflerin güncellendiğini bildir
+                Rpc(nameof(UpdateTradeOfferRpc), sessionId, session.RequesterItems.ToArray(), session.TargetItems.ToArray());
+                Rpc(nameof(UpdateConfirmationStatusRpc), sessionId, false, false);
+            }
+        }
+    }
+
+    [Rpc(MultiplayerApi.RMode.Authority)]
+    private void ConfirmTradeRpc(long sessionId, long clientId)
+    {
+        if (activeTrades.TryGetValue(sessionId, out TradeSession session))
+        {
+            if (session.requesterId == clientId)
+                session.requesterConfirmed = true;
+            else if (session.targetId == clientId)
+                session.targetConfirmed = true;
+                
+            if (session.requesterConfirmed && session.targetConfirmed)
+            {
+                ExecuteTrade(session);
+                // Ticaret tamamlandığı için oturumu listeden kaldır
+                activeTrades.Remove(sessionId);
+            }
+            else
+            {
+                 // Onay durumunun değiştiğini tüm ilgili istemcilere bildir
+                 Rpc(nameof(UpdateConfirmationStatusRpc), sessionId, session.requesterConfirmed, session.targetConfirmed);
+            }
+        }
+    }
+    
+    [Rpc(MultiplayerApi.RMode.Authority)]
+    public void CancelTradeRpc(long sessionId, long clientId)
+    {
+        if (activeTrades.TryGetValue(sessionId, out TradeSession session))
+        {
+            if (session.requesterId == clientId || session.targetId == clientId)
+            {
+                activeTrades.Remove(sessionId);
+                Rpc(nameof(TradeCancelledRpc), sessionId, $"Oyuncu {clientId} tarafından iptal edildi.");
+            }
+        }
+    }
+    
+    // Sunucu Tarafı: Eşya takasını gerçekleştir
+    private void ExecuteTrade(TradeSession session)
+    {
+        // **BURASI KRİTİK**: Gerçek envanter transferi ve hata yönetimi burada olmalıdır.
+        // Örneğin: 
+        /*
+        bool success = InventoryManager.TransferItems(session.requesterId, session.targetId, session.RequesterItems);
+        success &= InventoryManager.TransferItems(session.targetId, session.requesterId, session.TargetItems);
+        */
+        
+        bool success = true; 
+        
+        // İşlem tamamlandı mesajını tüm istemcilere gönder
+        Rpc(nameof(TradeCompleteRpc), session.sessionId, success);
+    }
+    
+    // ====================================================================
+    // 3. SUNUCUDAN İSTEMCİLERE RPC ÇAĞRILARI (UI Güncellemeleri)
+    // [Rpc(MultiplayerApi.RMode.AnyPeer)] ile işaretlenmiştir.
+    // ====================================================================
+    
+    [Rpc(MultiplayerApi.RMode.AnyPeer)] 
+    private void ReceiveTradeInviteRpc(long sessionId, long inviterId)
+    {
+        // Bu RPC, hedef oyuncunun istemcisinde çalışır.
+        GD.Print($"[İstemci] Ticaret Daveti: Oturum ID {sessionId}, Gönderen {inviterId}");
+        // Burada UI'da davet penceresini açın.
+    }
+    
+    [Rpc(MultiplayerApi.RMode.AnyPeer)] 
+    private void OpenTradeUIRpc(long sessionId)
+    {
+        // Bu RPC, ilgili oyuncuların istemcilerinde çalışır.
+        GD.Print($"[İstemci] Ticaret Oturumu Başladı: ID {sessionId}. Arayüzü aç.");
+        // İlgili UI kodlarını buraya ekleyin.
+    }
+    
+    [Rpc(MultiplayerApi.RMode.AnyPeer)] 
+    private void UpdateTradeOfferRpc(long sessionId, int[] requesterItems, int[] targetItems)
+    {
+        // Tüm ilgili istemcilere tekliflerin güncellendiğini bildirir.
+        GD.Print($"[İstemci] Ticaret Teklifleri Güncellendi. Req: {requesterItems.Length}, Target: {targetItems.Length}");
+        // UI'daki ticaret kutularını güncelleyin.
+    }
+    
+    [Rpc(MultiplayerApi.RMode.AnyPeer)]
+    private void UpdateConfirmationStatusRpc(long sessionId, bool reqConfirmed, bool targetConfirmed)
+    {
+        // Tüm ilgili istemcilere onay durumunun değiştiğini bildirir.
+        GD.Print($"[İstemci] Onay Durumu: İsteyen={reqConfirmed}, Hedef={targetConfirmed}");
+        // UI'da onay durumunu güncelleyin.
+    }
+    
+    [Rpc(MultiplayerApi.RMode.AnyPeer)]
+    private void TradeCompleteRpc(long sessionId, bool success)
+    {
+        // Ticaret arayüzünü kapat ve sonucu göster
+        GD.Print($"[İstemci] Ticaret Tamamlandı. Başarı: {success}");
+    }
+    
+    [Rpc(MultiplayerApi.RMode.AnyPeer)]
+    private void TradeCancelledRpc(long sessionId, string reason)
+    {
+        // Ticaret arayüzünü kapat ve iptal nedenini göster
+        GD.Print($"[İstemci] Ticaret İptal Edildi: ID {sessionId}. Sebep: {reason}");
+    }
+}
+
+// Ticaret oturumu veri sınıfı
+public class TradeSession
+{
+    public long sessionId;
+    public long requesterId;
+    public long targetId;
+    
+    // Envanterdeki eşyaların ID'leri veya Index'leri
+    public List<int> RequesterItems = new List<int>();
+    public List<int> TargetItems = new List<int>();
+    
+    public bool requesterConfirmed = false;
+    public bool targetConfirmed = false;
+    
+    public TradeSession(long sid, long req, long target)
+    {
+        sessionId = sid;
+        requesterId = req;
+        targetId = target;
+    }
+}
